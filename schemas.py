@@ -1,48 +1,51 @@
 """
-Database Schemas
+Database Schemas for Portfolio App
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
-
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Collections:
+- holding: individual positions entered by the user
+- pricecache: cached quotes by symbol & date to reduce external calls
+- setting: user/app settings (e.g., base currency)
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
+from datetime import date, datetime
 
-# Example schemas (replace with your own):
 
-class User(BaseModel):
+class Holding(BaseModel):
     """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
+    Collection: "holding"
+    One document per transaction (buy/sell). Sells use negative quantity.
+    currency: currency in which the trade was executed (e.g., EUR, USD)
     """
-    name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+    symbol: str = Field(..., description="Ticker or identifier compatible with Yahoo Finance")
+    name: Optional[str] = Field(None, description="Friendly name")
+    isin: Optional[str] = Field(None, description="ISIN if available")
+    asset_type: Optional[Literal["stock", "etf", "fund", "crypto", "other"]] = None
 
-class Product(BaseModel):
+    quantity: float = Field(..., description="Number of units; negative for sell")
+    price: float = Field(..., ge=0, description="Price per unit in trade currency")
+    trade_currency: str = Field(..., min_length=3, max_length=3, description="ISO currency code, e.g., EUR, USD")
+
+    trade_date: date = Field(..., description="Trade execution date")
+    notes: Optional[str] = None
+
+
+class PriceCache(BaseModel):
     """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
+    Collection: "pricecache"
+    Cached adjusted close prices by symbol and date (UTC date). Currency as returned by Yahoo.
     """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+    symbol: str
+    yyyymmdd: str  # e.g., 2025-11-16
+    currency: Optional[str] = None
+    adj_close: float
 
-# Add your own schemas here:
-# --------------------------------------------------
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class Setting(BaseModel):
+    """
+    Collection: "setting"
+    Store global settings like base currency.
+    """
+    key: str
+    value: str
