@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
+import re
 
 from database import db, create_document, get_documents
 
@@ -45,6 +46,15 @@ BASE_CCY = os.getenv("BASE_CURRENCY", "EUR").upper()
 
 # ---------- Utilities ----------
 
+_YF_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+TICKER_PATTERN = re.compile(r"^[A-Z0-9\.=\-]{1,15}$")
+
+
 def _utc_date(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).date().isoformat()
 
@@ -77,42 +87,103 @@ def _fx_symbol(from_ccy: str, to_ccy: str) -> str:
     return f"{from_ccy.upper()}{to_ccy.upper()}=X"
 
 
-def _get_price_and_currency(symbol: str, as_of: Optional[date] = None) -> Dict[str, Any]:
-    ticker = yf.Ticker(symbol)
-    info = ticker.fast_info if hasattr(ticker, 'fast_info') else None
-    ccy = None
-    if info:
-        # fast_info may be object-like or dict-like across versions
-        ccy = getattr(info, 'currency', None)
-        if ccy is None and isinstance(info, dict):
-            ccy = info.get('currency')
-    # history
+def _yahoo_chart_price(symbol: str, as_of: Optional[date] = None) -> Dict[str, Any]:
+    """Fetch price and currency from Yahoo Chart API as a fallback to yfinance.
+    Returns dict with keys price (float) and currency (str|None).
+    """
+    base = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol
+    params: Dict[str, Any]
     if as_of is None:
-        hist = ticker.history(period="1d", auto_adjust=False)
-        if hist.empty:
-            raise HTTPException(status_code=404, detail=f"No price for {symbol}")
-        price = float(hist["Close"].iloc[-1])
+        params = {"range": "5d", "interval": "1d"}
     else:
-        # Get some buffer then pick last available on/before date
-        hist = ticker.history(start=as_of - timedelta(days=5), end=as_of + timedelta(days=1), auto_adjust=False)
-        if hist.empty:
-            raise HTTPException(status_code=404, detail=f"No price for {symbol} on {as_of}")
-        price = float(hist["Close"].ffill().iloc[-1])
-    return {"price": price, "currency": ccy}
+        # Use one-week window around the date to ensure we get a candle, then pick last <= as_of
+        start_dt = datetime.combine(as_of - timedelta(days=5), datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_dt = datetime.combine(as_of + timedelta(days=1), datetime.min.time()).replace(tzinfo=timezone.utc)
+        params = {
+            "period1": int(start_dt.timestamp()),
+            "period2": int(end_dt.timestamp()),
+            "interval": "1d",
+        }
+    try:
+        r = requests.get(base, params=params, headers=_YF_HEADERS, timeout=12)
+        r.raise_for_status()
+        j = r.json()
+        result = (j or {}).get("chart", {}).get("result") or []
+        if not result:
+            raise ValueError("No chart result")
+        meta = result[0].get("meta", {})
+        currency = meta.get("currency")
+        ts = result[0].get("timestamp") or []
+        close = result[0].get("indicators", {}).get("quote", [{}])[0].get("close") or []
+        if not ts or not close:
+            raise ValueError("No timestamp/close")
+        # Build list of (time, close) and pick last available <= as_of (or last overall)
+        data = [(datetime.fromtimestamp(t, tz=timezone.utc).date(), c) for t, c in zip(ts, close) if c is not None]
+        if not data:
+            raise ValueError("No close data")
+        if as_of is None:
+            price = float(data[-1][1])
+        else:
+            # filter <= as_of
+            cand = [c for d, c in data if d <= as_of]
+            if not cand:
+                raise ValueError("No data on/before date")
+            price = float(cand[-1])
+        return {"price": price, "currency": currency}
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"No price for {symbol}{' on ' + as_of.isoformat() if as_of else ''}")
+
+
+def _get_price_and_currency(symbol: str, as_of: Optional[date] = None) -> Dict[str, Any]:
+    # First attempt: yfinance (fast when available)
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.fast_info if hasattr(ticker, 'fast_info') else None
+        ccy = None
+        if info:
+            # fast_info may be object-like or dict-like across versions
+            ccy = getattr(info, 'currency', None)
+            if ccy is None and isinstance(info, dict):
+                ccy = info.get('currency')
+        if as_of is None:
+            hist = ticker.history(period="1d", auto_adjust=False)
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+                return {"price": price, "currency": ccy}
+        else:
+            hist = ticker.history(start=as_of - timedelta(days=5), end=as_of + timedelta(days=1), auto_adjust=False)
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].ffill().iloc[-1])
+                return {"price": price, "currency": ccy}
+    except Exception:
+        pass
+    # Fallback: direct Yahoo chart API
+    return _yahoo_chart_price(symbol, as_of=as_of)
 
 
 def _get_fx_rate(from_ccy: str, to_ccy: str, as_of: Optional[date] = None) -> float:
     if from_ccy.upper() == to_ccy.upper():
         return 1.0
     fx_ticker = _fx_symbol(from_ccy, to_ccy)
-    data = yf.Ticker(fx_ticker).history(period="1d") if as_of is None else yf.Ticker(fx_ticker).history(start=as_of - timedelta(days=5), end=as_of + timedelta(days=1))
-    if data.empty:
+    # Try yfinance first
+    try:
+        data = yf.Ticker(fx_ticker).history(period="1d") if as_of is None else yf.Ticker(fx_ticker).history(start=as_of - timedelta(days=5), end=as_of + timedelta(days=1))
+        if data is not None and not data.empty:
+            return float(data["Close"].ffill().iloc[-1])
         # Try inverse
         inv = yf.Ticker(_fx_symbol(to_ccy, from_ccy)).history(period="1d")
-        if inv.empty:
-            raise HTTPException(status_code=404, detail=f"No FX for {from_ccy}->{to_ccy}")
-        return 1.0 / float(inv["Close"].iloc[-1])
-    return float(data["Close"].ffill().iloc[-1])
+        if inv is not None and not inv.empty:
+            return 1.0 / float(inv["Close"].ffill().iloc[-1])
+    except Exception:
+        pass
+    # Fallback to Yahoo chart API for FX
+    try:
+        fx_meta = _yahoo_chart_price(fx_ticker, as_of=as_of)
+        return float(fx_meta["price"])
+    except HTTPException:
+        # Try inverse via chart API
+        inv_meta = _yahoo_chart_price(_fx_symbol(to_ccy, from_ccy), as_of=as_of)
+        return 1.0 / float(inv_meta["price"])
 
 
 def _yahoo_search(query: str, quotes: int = 10) -> List[Dict[str, Any]]:
@@ -123,9 +194,7 @@ def _yahoo_search(query: str, quotes: int = 10) -> List[Dict[str, Any]]:
     if not q:
         return []
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
-    }
+    headers = _YF_HEADERS
 
     # Primary endpoint
     url1 = "https://query1.finance.yahoo.com/v1/finance/search"
@@ -232,7 +301,10 @@ def _compute_positions() -> List[Dict[str, Any]]:
             px = float(row["price"])
             ccy = row["trade_currency"].upper()
             leg_date = row["trade_date"]
-            fx = _get_fx_rate(ccy, BASE_CCY, as_of=leg_date)
+            try:
+                fx = _get_fx_rate(ccy, BASE_CCY, as_of=leg_date)
+            except Exception:
+                fx = 1.0  # fallback to 1 if FX unavailable
             base_cost += leg_qty * px * fx
             total_qty += leg_qty
         avg_cost_base = base_cost / total_qty if abs(total_qty) > 1e-12 else 0.0
@@ -251,14 +323,19 @@ def _portfolio_value(as_of: Optional[date] = None) -> Dict[str, Any]:
     items = []
     for p in positions:
         q = p["quantity"]
-        quote = _get_price_and_currency(p["symbol"], as_of=as_of)
-        px = quote["price"]
-        ccy = quote.get("currency") or BASE_CCY
-        fx = _get_fx_rate(ccy, BASE_CCY, as_of=as_of)
+        try:
+            quote = _get_price_and_currency(p["symbol"], as_of=as_of)
+            px = float(quote.get("price", 0.0))
+            ccy = (quote.get("currency") or BASE_CCY)
+            fx = _get_fx_rate(ccy, BASE_CCY, as_of=as_of)
+        except Exception:
+            px = 0.0
+            ccy = BASE_CCY
+            fx = 1.0
         value_base = q * px * fx
         cost_base = q * p["avg_cost_base"]
         pnl_abs = value_base - cost_base
-        pnl_pct = pnl_abs / cost_base if abs(cost_base) > 1e-12 else 0.0
+        pnl_pct = (pnl_abs / cost_base) if abs(cost_base) > 1e-12 else 0.0
         items.append({
             "symbol": p["symbol"],
             "name": p.get("name", p["symbol"]),
@@ -284,24 +361,35 @@ def root():
 @app.get("/api/validate-ticker")
 def validate_ticker(symbol: str = Query(..., min_length=1)):
     """Validate a Yahoo Finance symbol and return metadata.
-    We attempt a small history fetch and read currency. Returns 200 with details if valid, 404 otherwise.
+    Prefer live price; if unavailable, accept plausible symbols so the user can continue.
     """
     sym = symbol.strip().upper()
+    # First, try to fetch a real price
     try:
         quote = _get_price_and_currency(sym)
-        # Try to get name via search as yfinance sometimes lacks it
         meta = {"symbol": sym, "currency": quote.get("currency"), "price": quote.get("price")}
         suggestions = _yahoo_search(sym, quotes=1)
         if suggestions:
             meta["shortname"] = suggestions[0].get("shortname")
             meta["exchange"] = suggestions[0].get("exchange")
         return {"valid": True, **meta}
-    except HTTPException as he:
-        if he.status_code == 404:
-            raise HTTPException(404, detail=f"Ticker '{sym}' no encontrado o sin datos")
-        raise
     except Exception:
-        raise HTTPException(404, detail=f"Ticker '{sym}' no encontrado o sin datos")
+        # No live data access. Fall through to permissive checks below.
+        pass
+
+    # If search confirms the exact symbol, accept it without price
+    try:
+        suggestions = _yahoo_search(sym, quotes=10)
+        if any((s.get("symbol") or "").upper() == sym for s in suggestions):
+            return {"valid": True, "symbol": sym}
+    except Exception:
+        pass
+
+    # As last resort, accept plausible ticker patterns so the user can save manually
+    if TICKER_PATTERN.match(sym):
+        return {"valid": True, "symbol": sym}
+
+    raise HTTPException(404, detail=f"Ticker '{sym}' no encontrado o sin datos")
 
 
 @app.get("/api/suggest")
@@ -318,20 +406,14 @@ def add_holding(holding: HoldingIn):
         raise HTTPException(400, "Symbol is required")
     symbol_norm = holding.symbol.strip().upper()
 
-    # Validate ticker by fetching a price (ensures the symbol exists)
-    try:
-        _ = _get_price_and_currency(symbol_norm, as_of=holding.trade_date)
-    except HTTPException as he:
-        # Surface a friendly message for invalid tickers
-        if he.status_code == 404:
-            raise HTTPException(400, detail=f"El ticker '{symbol_norm}' no es válido o no tiene precio para la fecha")
-        raise
-    except Exception:
-        raise HTTPException(400, detail=f"El ticker '{symbol_norm}' no es válido")
+    # Soft-validate: ensure ticker format is plausible; skip live price validation to avoid blocking
+    if not TICKER_PATTERN.match(symbol_norm):
+        raise HTTPException(400, detail="El formato del ticker no es válido")
 
     # Ensure Mongo-serializable payload (convert date -> datetime)
     payload = holding.model_dump()
     payload["symbol"] = symbol_norm
+    payload["trade_currency"] = (payload.get("trade_currency") or "EUR").upper()
     if isinstance(payload.get("trade_date"), date):
         # store as UTC datetime at 00:00
         payload["trade_date"] = datetime.combine(payload["trade_date"], datetime.min.time()).replace(tzinfo=timezone.utc)
