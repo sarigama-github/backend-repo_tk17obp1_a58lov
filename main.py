@@ -192,8 +192,13 @@ def add_holding(holding: HoldingIn):
     # Basic validation
     if not holding.symbol:
         raise HTTPException(400, "Symbol is required")
+    # Ensure Mongo-serializable payload (convert date -> datetime)
+    payload = holding.model_dump()
+    if isinstance(payload.get("trade_date"), date):
+        # store as UTC datetime at 00:00
+        payload["trade_date"] = datetime.combine(payload["trade_date"], datetime.min.time()).replace(tzinfo=timezone.utc)
     # store
-    create_document("holding", holding.model_dump())
+    create_document("holding", payload)
     return {"status": "ok"}
 
 
