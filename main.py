@@ -116,25 +116,94 @@ def _get_fx_rate(from_ccy: str, to_ccy: str, as_of: Optional[date] = None) -> fl
 
 
 def _yahoo_search(query: str, quotes: int = 10) -> List[Dict[str, Any]]:
-    """Use Yahoo's public search endpoint to get ticker suggestions."""
-    url = "https://query1.finance.yahoo.com/v1/finance/search"
-    params = {"q": query, "quotesCount": quotes, "newsCount": 0, "listsCount": 0}
-    try:
-        r = requests.get(url, params=params, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        results = []
-        for q in data.get("quotes", [])[:quotes]:
-            results.append({
-                "symbol": q.get("symbol"),
-                "shortname": q.get("shortname") or q.get("longname") or q.get("name"),
-                "exchange": q.get("exchDisp") or q.get("exchange"),
-                "type": q.get("quoteType"),
-                "currency": q.get("currency"),
-            })
-        return results
-    except Exception:
+    """Robust Yahoo search with fallback to autocomplete API.
+    Returns up to `quotes` results with symbol, name, exchange, type, currency.
+    """
+    q = (query or "").strip()
+    if not q:
         return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36"
+    }
+
+    # Primary endpoint
+    url1 = "https://query1.finance.yahoo.com/v1/finance/search"
+    params1 = {
+        "q": q,
+        "quotesCount": quotes,
+        "newsCount": 0,
+        "listsCount": 0,
+        "enableFuzzyQuery": "true",
+        "lang": "es-ES",
+        "region": "ES",
+    }
+
+    def _norm_item(sym: Optional[str], name: Optional[str], exch: Optional[str], qtype: Optional[str], ccy: Optional[str]):
+        return {
+            "symbol": sym,
+            "shortname": name,
+            "exchange": exch,
+            "type": qtype,
+            "currency": ccy,
+        }
+
+    results: List[Dict[str, Any]] = []
+    try:
+        r = requests.get(url1, params=params1, timeout=8, headers=headers)
+        r.raise_for_status()
+        data = r.json() or {}
+        for it in (data.get("quotes") or [])[:quotes]:
+            results.append(
+                _norm_item(
+                    it.get("symbol"),
+                    it.get("shortname") or it.get("longname") or it.get("name"),
+                    it.get("exchDisp") or it.get("exchange"),
+                    it.get("quoteType"),
+                    it.get("currency"),
+                )
+            )
+    except Exception:
+        results = []
+
+    # Fallback if empty: query2 autocomplete API
+    if not results:
+        url2 = "https://query2.finance.yahoo.com/v6/finance/autocomplete"
+        params2 = {"query": q, "lang": "es-ES", "region": "ES"}
+        try:
+            r2 = requests.get(url2, params=params2, timeout=8, headers=headers)
+            r2.raise_for_status()
+            data2 = r2.json() or {}
+            for it in (data2.get("ResultSet", {}).get("Result") or [])[:quotes]:
+                results.append(
+                    _norm_item(
+                        it.get("symbol"),
+                        it.get("name"),
+                        it.get("exchDisp") or it.get("exch") or it.get("exchDisp"),
+                        it.get("typeDisp") or it.get("type"),
+                        it.get("exch"),  # currency not provided here; keep None or exch code
+                    )
+                )
+        except Exception:
+            results = []
+
+    # Heuristic: if user typed something like "NXT" and we're in Spain, also try .MC suffix
+    if not results and q.isalpha() and len(q) <= 5:
+        for suffix in [".MC", ".MA", ".LS", ".PA", ".MI"]:
+            sym_try = (q.upper() + suffix)
+            results.append(_norm_item(sym_try, None, None, None, None))
+            if len(results) >= quotes:
+                break
+
+    # Deduplicate by symbol, keep order
+    seen = set()
+    deduped = []
+    for it in results:
+        sym = it.get("symbol")
+        if sym and sym not in seen:
+            seen.add(sym)
+            deduped.append(it)
+    return deduped[:quotes]
 
 
 def _compute_positions() -> List[Dict[str, Any]]:
