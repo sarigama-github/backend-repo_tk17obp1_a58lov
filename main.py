@@ -8,6 +8,7 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import requests
 
 from database import db, create_document, get_documents
 
@@ -81,7 +82,10 @@ def _get_price_and_currency(symbol: str, as_of: Optional[date] = None) -> Dict[s
     info = ticker.fast_info if hasattr(ticker, 'fast_info') else None
     ccy = None
     if info:
-        ccy = getattr(info, 'currency', None) or info.get('currency') if isinstance(info, dict) else None
+        # fast_info may be object-like or dict-like across versions
+        ccy = getattr(info, 'currency', None)
+        if ccy is None and isinstance(info, dict):
+            ccy = info.get('currency')
     # history
     if as_of is None:
         hist = ticker.history(period="1d", auto_adjust=False)
@@ -111,6 +115,28 @@ def _get_fx_rate(from_ccy: str, to_ccy: str, as_of: Optional[date] = None) -> fl
     return float(data["Close"].ffill().iloc[-1])
 
 
+def _yahoo_search(query: str, quotes: int = 10) -> List[Dict[str, Any]]:
+    """Use Yahoo's public search endpoint to get ticker suggestions."""
+    url = "https://query1.finance.yahoo.com/v1/finance/search"
+    params = {"q": query, "quotesCount": quotes, "newsCount": 0, "listsCount": 0}
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for q in data.get("quotes", [])[:quotes]:
+            results.append({
+                "symbol": q.get("symbol"),
+                "shortname": q.get("shortname") or q.get("longname") or q.get("name"),
+                "exchange": q.get("exchDisp") or q.get("exchange"),
+                "type": q.get("quoteType"),
+                "currency": q.get("currency"),
+            })
+        return results
+    except Exception:
+        return []
+
+
 def _compute_positions() -> List[Dict[str, Any]]:
     txs = get_documents("holding", {})
     df = pd.DataFrame(txs)
@@ -127,8 +153,7 @@ def _compute_positions() -> List[Dict[str, Any]]:
         qty = grp["quantity"].sum()
         if abs(qty) < 1e-9:
             continue
-        # Average cost in trade currency weighted by quantity (buys positive, sells negative handled naturally)
-        # Convert each leg to base currency using FX at trade date
+        # Weighted cost in base currency using FX at trade date
         base_cost = 0.0
         total_qty = 0.0
         for _, row in grp.iterrows():
@@ -187,19 +212,63 @@ def root():
     return {"message": "Portfolio API running", "base_currency": BASE_CCY}
 
 
+@app.get("/api/validate-ticker")
+def validate_ticker(symbol: str = Query(..., min_length=1)):
+    """Validate a Yahoo Finance symbol and return metadata.
+    We attempt a small history fetch and read currency. Returns 200 with details if valid, 404 otherwise.
+    """
+    sym = symbol.strip().upper()
+    try:
+        quote = _get_price_and_currency(sym)
+        # Try to get name via search as yfinance sometimes lacks it
+        meta = {"symbol": sym, "currency": quote.get("currency"), "price": quote.get("price")}
+        suggestions = _yahoo_search(sym, quotes=1)
+        if suggestions:
+            meta["shortname"] = suggestions[0].get("shortname")
+            meta["exchange"] = suggestions[0].get("exchange")
+        return {"valid": True, **meta}
+    except HTTPException as he:
+        if he.status_code == 404:
+            raise HTTPException(404, detail=f"Ticker '{sym}' no encontrado o sin datos")
+        raise
+    except Exception:
+        raise HTTPException(404, detail=f"Ticker '{sym}' no encontrado o sin datos")
+
+
+@app.get("/api/suggest")
+def suggest(q: str = Query(..., min_length=1), limit: int = 8):
+    """Autocomplete suggestions from Yahoo search."""
+    results = _yahoo_search(q.strip(), quotes=limit)
+    return {"query": q, "results": results}
+
+
 @app.post("/api/holdings")
 def add_holding(holding: HoldingIn):
-    # Basic validation
+    # Basic validation and normalization
     if not holding.symbol:
         raise HTTPException(400, "Symbol is required")
+    symbol_norm = holding.symbol.strip().upper()
+
+    # Validate ticker by fetching a price (ensures the symbol exists)
+    try:
+        _ = _get_price_and_currency(symbol_norm, as_of=holding.trade_date)
+    except HTTPException as he:
+        # Surface a friendly message for invalid tickers
+        if he.status_code == 404:
+            raise HTTPException(400, detail=f"El ticker '{symbol_norm}' no es válido o no tiene precio para la fecha")
+        raise
+    except Exception:
+        raise HTTPException(400, detail=f"El ticker '{symbol_norm}' no es válido")
+
     # Ensure Mongo-serializable payload (convert date -> datetime)
     payload = holding.model_dump()
+    payload["symbol"] = symbol_norm
     if isinstance(payload.get("trade_date"), date):
         # store as UTC datetime at 00:00
         payload["trade_date"] = datetime.combine(payload["trade_date"], datetime.min.time()).replace(tzinfo=timezone.utc)
     # store
     create_document("holding", payload)
-    return {"status": "ok"}
+    return {"status": "ok", "symbol": symbol_norm}
 
 
 @app.get("/api/portfolio")
